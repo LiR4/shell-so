@@ -1,71 +1,119 @@
 const std = @import("std");
-const Io = std.Io;
+const posix = std.posix;
+const linux = std.os.linux;
 
-const shell_so = @import("shell_so");
+// ============================================================================
+// Camada de Compatibilidade POSIX / I/O para Zig 0.16.0
+// ============================================================================
 
-pub fn main(init: std.process.Init) !void {
-    // Prints to stderr, unbuffered, ignoring potential errors.
-    std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
+fn isLinuxErr(rc: usize) bool {
+    return rc > @as(usize, @bitCast(@as(isize, -4096)));
+}
 
-    // This is appropriate for anything that lives as long as the process.
-    const arena: std.mem.Allocator = init.arena.allocator();
+fn sysRead(fd: i32, buf: []u8) !usize {
+    const rc = linux.read(fd, buf.ptr, buf.len);
+    if (isLinuxErr(rc)) return error.ReadFailed;
+    return rc;
+}
 
-    // Accessing command line arguments:
-    const args = try init.minimal.args.toSlice(arena);
-    for (args) |arg| {
-        std.log.info("arg: {s}", .{arg});
+fn sysWrite(fd: i32, data: []const u8) !void {
+    var written: usize = 0;
+    while (written < data.len) {
+        const rc = linux.write(fd, data[written..].ptr, data.len - written);
+        if (isLinuxErr(rc)) return error.WriteFailed;
+        if (rc == 0) break;
+        written += rc;
+    }
+}
+
+fn sysClose(fd: i32) void {
+    _ = linux.close(fd);
+}
+
+fn getCwd(buf: []u8) ![]const u8 {
+    const rc = linux.getcwd(buf.ptr, buf.len);
+    if (isLinuxErr(rc) or rc == 0) return error.GetCwdFailed;
+    const slice = buf[0..rc];
+    if (std.mem.indexOfScalar(u8, slice, 0)) |nul_idx| {
+        return slice[0..nul_idx];
+    }
+    return slice;
+}
+
+const File = struct {
+    fd: i32,
+
+    pub const Reader = struct {
+        fd: i32,
+        pub fn read(self: Reader, buf: []u8) !usize {
+            return sysRead(self.fd, buf);
+        }
+        pub fn readUntilDelimiterOrEof(self: Reader, buf: []u8, delimiter: u8) !?[]u8 {
+            var idx: usize = 0;
+            while (idx < buf.len) {
+                var byte: [1]u8 = undefined;
+                const n = try sysRead(self.fd, &byte);
+                if (n == 0) {
+                    if (idx == 0) return null;
+                    break;
+                }
+                if (byte[0] == delimiter) break;
+                buf[idx] = byte[0];
+                idx += 1;
+            }
+            return buf[0..idx];
+        }
+    };
+
+    pub const Writer = struct {
+        fd: i32,
+        pub fn writeAll(self: Writer, data: []const u8) !void {
+            try sysWrite(self.fd, data);
+        }
+        pub fn print(self: Writer, comptime fmt: []const u8, args: anytype) !void {
+            var buf: [4096]u8 = undefined;
+            const slice = try std.fmt.bufPrint(&buf, fmt, args);
+            try sysWrite(self.fd, slice);
+        }
+    };
+
+    pub fn reader(self: File) Reader {
+        return .{ .fd = self.fd };
     }
 
-    // In order to do I/O operations need an `Io` instance.
-    const io = init.io;
+    pub fn writer(self: File) Writer {
+        return .{ .fd = self.fd };
+    }
 
-    // Stdout is for the actual output of your application, for example if you
-    // are implementing gzip, then only the compressed bytes should be sent to
-    // stdout, not any debugging messages.
-    var stdout_buffer: [1024]u8 = undefined;
-    var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
-    const stdout_writer = &stdout_file_writer.interface;
+    pub fn close(self: File) void {
+        sysClose(self.fd);
+    }
+};
 
-    try shell_so.printAnotherMessage(stdout_writer);
+// Utilização da assinatura idiomática Juicy Main em Zig 0.16.0
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    _ = allocator;
 
-    try stdout_writer.flush(); // Don't forget to flush!
-}
+    const stdin = (File{ .fd = 0 }).reader();
+    const stdout = (File{ .fd = 1 }).writer();
 
-test "simple test" {
-    const gpa = std.testing.allocator;
-    var list: std.ArrayList(i32) = .empty;
-    defer list.deinit(gpa); // Try commenting this out and see if zig detects the memory leak!
-    try list.append(gpa, 42);
-    try std.testing.expectEqual(@as(i32, 42), list.pop());
-}
+    var cwd_buf: [4096]u8 = undefined;
+    var line_buf: [4096]u8 = undefined;
 
-test "fuzz example" {
-    try std.testing.fuzz({}, testOne, .{});
-}
+    while (true) {
+        // TODO 1: Exibir Prompt Dinâmico exibindo o diretório de trabalho atual (getCwd)
+        const current_cwd = try getCwd(&cwd_buf);
+        try stdout.print("zigsh [{s}]> ", .{current_cwd});
 
-fn testOne(context: void, smith: *std.testing.Smith) !void {
-    _ = context;
-    // Try passing `--fuzz` to `zig build test` and see if it manages to fail this test case!
-
-    const gpa = std.testing.allocator;
-    var list: std.ArrayList(u8) = .empty;
-    defer list.deinit(gpa);
-    while (!smith.eos()) switch (smith.value(enum { add_data, dup_data })) {
-        .add_data => {
-            const slice = try list.addManyAsSlice(gpa, smith.value(u4));
-            smith.bytes(slice);
-        },
-        .dup_data => {
-            if (list.items.len == 0) continue;
-            if (list.items.len > std.math.maxInt(u32)) return error.SkipZigTest;
-            const len = smith.valueRangeAtMost(u32, 1, @min(32, list.items.len));
-            const off = smith.valueRangeAtMost(u32, 0, @intCast(list.items.len - len));
-            try list.appendSlice(gpa, list.items[off..][0..len]);
-            try std.testing.expectEqualSlices(
-                u8,
-                list.items[off..][0..len],
-                list.items[list.items.len - len ..],
-            );
-        },
-    };
+        // TODO 2: Ler a linha digitada pelo usuário no stdin
+        // Tratamento de EOF (Ctrl+D) para encerramento gracioso
+        const maybe_line = try stdin.readUntilDelimiterOrEof(&line_buf, '\n');
+        const raw_line = maybe_line orelse {
+            try stdout.writeAll("\n");
+            break;
+        };
+        const trimmed_line = std.mem.trim(u8, raw_line, " \t\r\n");
+        if (trimmed_line.len == 0) continue;
+    }
 }
