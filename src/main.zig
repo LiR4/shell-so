@@ -142,6 +142,36 @@ const File = struct {
     }
 };
 
+const CwdDir = struct {
+    allocator: std.mem.Allocator,
+
+    pub fn openFile(self: CwdDir, path: []const u8) !File {
+        const path_z = try self.allocator.dupeZ(u8, path);
+        defer self.allocator.free(path_z);
+        const at_fdcwd: usize = @bitCast(@as(isize, -100));
+        const o_rdonly: usize = 0;
+        const rc = linux.syscall4(.openat, at_fdcwd, @intFromPtr(path_z.ptr), o_rdonly, 0);
+        if (isLinuxErr(rc)) return error.FileNotFound;
+        return File{ .fd = @intCast(rc) };
+    }
+
+    pub fn createFile(self: CwdDir, path: []const u8) !File {
+        const path_z = try self.allocator.dupeZ(u8, path);
+        defer self.allocator.free(path_z);
+        const at_fdcwd: usize = @bitCast(@as(isize, -100));
+        // O_WRONLY (0o1) | O_CREAT (0o100) | O_TRUNC (0o1000) = 0o1101
+        const flags: usize = 0o1101;
+        const mode: usize = 0o644;
+        const rc = linux.syscall4(.openat, at_fdcwd, @intFromPtr(path_z.ptr), flags, mode);
+        if (isLinuxErr(rc)) return error.CreateFailed;
+        return File{ .fd = @intCast(rc) };
+    }
+};
+
+fn cwd(allocator: std.mem.Allocator) CwdDir {
+    return .{ .allocator = allocator };
+}
+
 fn execInChild(argv_slices: []const []const u8) noreturn {
     const envp = [_:null]?[*:0]const u8{
         "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -417,6 +447,15 @@ fn parseSingleCommand(
     return cmd;
 }
 
+fn pumpStream(reader: File.Reader, writer: File.Writer) !void {
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = try reader.read(&buf);
+        if (n == 0) break;
+        try writer.writeAll(buf[0..n]);
+    }
+}
+
 // Utilização da assinatura idiomática Juicy Main em Zig 0.16.0
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
@@ -485,10 +524,45 @@ pub fn main(init: std.process.Init) !void {
         // TODO 5: Configurar e disparar a execução de Comandos Externos via Child
         var child = Child.init(cmd.args.items, allocator);
 
+        if (cmd.stdin_file != null) child.stdin_behavior = .Pipe;
+        if (cmd.stdout_file != null) child.stdout_behavior = .Pipe;
+        if (cmd.stderr_file != null) child.stderr_behavior = .Pipe;
+
         child.spawn() catch |err| {
             try stdout.print("Erro ao executar '{s}': {}\n", .{ cmd_name, err });
             continue;
         };
+
+        // TODO 6: Implementar a lógica de leitura/escrita para os arquivos de redirecionamento
+        if (cmd.stdin_file) |in_path| {
+            const in_file = try cwd(temp_alloc).openFile(in_path);
+            defer in_file.close();
+            if (child.stdin) |c_in| {
+                try pumpStream(in_file.reader(), c_in.writer());
+                c_in.close();
+                child.stdin = null;
+            }
+        }
+
+        if (cmd.stdout_file) |out_path| {
+            const out_file = try cwd(temp_alloc).createFile(out_path);
+            defer out_file.close();
+            if (child.stdout) |c_out| {
+                try pumpStream(c_out.reader(), out_file.writer());
+                c_out.close();
+                child.stdout = null;
+            }
+        }
+
+        if (cmd.stderr_file) |err_path| {
+            const err_file = try cwd(temp_alloc).createFile(err_path);
+            defer err_file.close();
+            if (child.stderr) |c_err| {
+                try pumpStream(c_err.reader(), err_file.writer());
+                c_err.close();
+                child.stderr = null;
+            }
+        }
 
         // TODO 8: Controle de Concorrência:
         // - Se cmd.is_background == true: exibir mensagem de background e NÃO aguardar
