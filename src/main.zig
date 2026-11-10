@@ -3,7 +3,7 @@ const posix = std.posix;
 const linux = std.os.linux;
 
 // ============================================================================
-// Camada de Compatibilidade POSIX / I/O para Zig 0.16.0.
+// Camada de Compatibilidade POSIX / I/O para Zig 0.16.0
 // ============================================================================
 
 fn isLinuxErr(rc: usize) bool {
@@ -38,6 +38,13 @@ fn getCwd(buf: []u8) ![]const u8 {
         return slice[0..nul_idx];
     }
     return slice;
+}
+
+fn changeCurDir(allocator: std.mem.Allocator, path: []const u8) !void {
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+    const rc = linux.chdir(path_z.ptr);
+    if (isLinuxErr(rc)) return error.ChdirFailed;
 }
 
 const File = struct {
@@ -246,10 +253,40 @@ pub fn main(init: std.process.Init) !void {
         const trimmed_line = std.mem.trim(u8, raw_line, " \t\r\n");
         if (trimmed_line.len == 0) continue;
 
-        // TODO 3: Fazer a tokenização da linha e identificar redirecionamentos e background
+        // TODO 3: Fazer a tokenização da linha
         var cmd = try parseSingleCommand(temp_alloc, allocator, trimmed_line);
         defer cmd.deinit();
 
         if (cmd.args.items.len == 0) continue;
+        const cmd_name = cmd.args.items[0];
+
+        // TODO 4: Verificar e executar Comandos Internos (cd, pwd, help, exit)
+        if (std.mem.eql(u8, cmd_name, "cd")) {
+            const target_dir = if (cmd.args.items.len > 1) cmd.args.items[1] else "/";
+            changeCurDir(temp_alloc, target_dir) catch |err| {
+                try stdout.print("cd: erro ao acessar '{s}': {}\n", .{ target_dir, err });
+            };
+            continue;
+        } else if (std.mem.eql(u8, cmd_name, "pwd")) {
+            const dir_str = try getCwd(&cwd_buf);
+            try stdout.print("{s}\n", .{dir_str});
+            continue;
+        } else if (std.mem.eql(u8, cmd_name, "help")) {
+            try stdout.writeAll(
+                "zigsh - Comandos internos suportados:\n" ++
+                    "  cd [dir]     : Altera o diretorio de trabalho atual\n" ++
+                    "  pwd          : Exibe o diretorio de trabalho atual\n" ++
+                    "  help         : Exibe esta mensagem de ajuda\n" ++
+                    "  exit [cod]   : Encerra o shell com o codigo informado\n" ++
+                    "Operadores: > (stdout), 2> (stderr), < (stdin), & (background), | (pipe)\n",
+            );
+            continue;
+        } else if (std.mem.eql(u8, cmd_name, "exit")) {
+            const code: u8 = if (cmd.args.items.len > 1)
+                std.fmt.parseInt(u8, cmd.args.items[1], 10) catch 0
+            else
+                0;
+            std.process.exit(code);
+        }
     }
 }
