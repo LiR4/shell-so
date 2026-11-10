@@ -3,7 +3,7 @@ const posix = std.posix;
 const linux = std.os.linux;
 
 // ============================================================================
-// Camada de Compatibilidade POSIX / I/O para Zig 0.16.0
+// Camada de Compatibilidade POSIX / I/O para Zig 0.16.0.
 // ============================================================================
 
 fn isLinuxErr(rc: usize) bool {
