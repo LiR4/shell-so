@@ -458,6 +458,7 @@ fn pumpStream(reader: File.Reader, writer: File.Writer) !void {
 
 // Utilização da assinatura idiomática Juicy Main em Zig 0.16.0
 pub fn main(init: std.process.Init) !void {
+    // Em Zig 0.16.0, o GeneralPurposeAllocator já é entregue pronto em init.gpa
     const allocator = init.gpa;
 
     const stdin = (File{ .fd = 0 }).reader();
@@ -485,7 +486,47 @@ pub fn main(init: std.process.Init) !void {
         const trimmed_line = std.mem.trim(u8, raw_line, " \t\r\n");
         if (trimmed_line.len == 0) continue;
 
-        // TODO 3: Fazer a tokenização da linha
+        // TODO 3: Fazer a tokenização da linha e identificar:
+        // - Pipeline (|) separando sub-comandos
+        // - Redirecionamentos (>, 2>, <)
+        // - Operador de Background (& ao final do comando)
+        if (std.mem.indexOfScalar(u8, trimmed_line, '|')) |pipe_idx| {
+            // TODO 7: Implementar o encadeamento I/O entre processos conectados por Pipeline (|)
+            // Conectar o stdout.Pipe do processo 1 ao stdin.Pipe do processo 2
+            const left_part = std.mem.trim(u8, trimmed_line[0..pipe_idx], " \t");
+            const right_part = std.mem.trim(u8, trimmed_line[pipe_idx + 1 ..], " \t");
+
+            var cmd1 = try parseSingleCommand(temp_alloc, allocator, left_part);
+            defer cmd1.deinit();
+            var cmd2 = try parseSingleCommand(temp_alloc, allocator, right_part);
+            defer cmd2.deinit();
+
+            if (cmd1.args.items.len == 0 or cmd2.args.items.len == 0) continue;
+
+            var child1 = Child.init(cmd1.args.items, allocator);
+            child1.stdout_behavior = .Pipe;
+
+            var child2 = Child.init(cmd2.args.items, allocator);
+            child2.stdin_behavior = .Pipe;
+
+            try child1.spawn();
+            try child2.spawn();
+
+            if (child1.stdout) |c1_out| {
+                if (child2.stdin) |c2_in| {
+                    try pumpStream(c1_out.reader(), c2_in.writer());
+                    c2_in.close();
+                    child2.stdin = null;
+                }
+                c1_out.close();
+                child1.stdout = null;
+            }
+
+            _ = try child1.wait();
+            _ = try child2.wait();
+            continue;
+        }
+
         var cmd = try parseSingleCommand(temp_alloc, allocator, trimmed_line);
         defer cmd.deinit();
 
